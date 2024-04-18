@@ -21,3 +21,6 @@ improving the convergence of areas of disocclusion. Our system yields superior r
 - Windows 10 SDK version 10.0.19041.1 Or newer
 - RTX 2060 or higher (Graphics card with raytracing support)
 - Unity 2023.2 or newer
+
+## Acknowledgment
+Special thanks to [Megascans](https://quixel.com/megascans/home?category=3D%20asset&category=food&assetId=tgykfhgpa) for their exceptional assets.
