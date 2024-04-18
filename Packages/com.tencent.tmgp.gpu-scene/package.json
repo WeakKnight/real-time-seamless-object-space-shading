@@ -1,0 +1,13 @@
+{
+  "name": "com.tencent.tmgp.gpu-scene",
+  "description": "GPU Driven Distance Field Scene Management.",
+  "version": "0.1.0",
+  "unity": "2022.3",
+  "unityRelease": "4f1",
+  "displayName": "GPU Scene",
+  "dependencies": {
+    "com.unity.burst": "1.8.8",
+    "com.unity.mathematics": "1.2.6",
+    "com.unity.collections": "2.2.1"
+  }
+}

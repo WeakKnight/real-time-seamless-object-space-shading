@@ -1,0 +1,101 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma use_dxc
+#pragma require int64BufferAtomics
+#pragma require inlineraytracing
+#pragma kernel CSMain
+
+#include "GPUScene.cginc"
+
+RWTexture2D<float4> _Output;
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+int _VisMode;
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+//RWByteAddressBuffer _PrintBuffer;
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    _Output.GetDimensions(width, height);
+    if (any(id.xy >= uint2(width, height)))
+    {
+        return;
+    }
+    
+    // Transform pixel to [-1,1] range
+    float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(uv);
+
+    //if (all(id.xyz == 0))
+    //{
+    //    DF_InstanceData instanceData = DF_LoadInstanceData(0);
+    //    DF_AssetData assetData = DF_LoadAssetData(0);
+    //    _PrintBuffer.Store3(0, asuint(assetData.volumeExtent));
+    //    _PrintBuffer.Store4(16, asuint(instanceData.localToWorld[1]));
+    //    _PrintBuffer.Store4(32, asuint(instanceData.localToWorld[2]));
+    //}
+
+    float3 res = 0.0f;
+    uint instanceIndex;
+    GPUScene_Intersection intersection;
+    if (GPUScene_Intersect(0.5f, ray.origin, ray.direction, 1e30f, intersection))
+    {
+        // float3 OutWorldNormal = float4(, 1.0f).xyz;
+        if (_VisMode == 0)
+        {
+            res = intersection.baseColor;
+        }
+        else if (_VisMode == 1)
+        {
+            res = intersection.emissive;
+        }
+        else if (_VisMode == 2)
+        {
+            res = intersection.hitNormalW.xyz * 0.5f + 0.5f;
+        }
+        else if (_VisMode == 3)
+        {
+            res = intersection.irradiance;
+        }
+        else if (_VisMode == 4)
+        {
+            res = intersection.hitPosW;
+        }
+    }
+    else
+    {
+        float3 skyColor = GPUScene_GetSkyColor(ray.direction);
+        res = skyColor;
+    }
+    _Output[id.xy] = float4(res, 1.0f);
+}

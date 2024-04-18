@@ -1,0 +1,60 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma use_dxc
+
+#pragma kernel PostProcess
+
+Texture2D<float4> _Input;
+RWTexture2D<float4> _Output;
+
+/** Returns a sRGB version of an input linear RGB channel value in the ITU-R BT.709 color space
+    \param LinearColor linear input channel value
+*/
+float linearToSRGB(float lin)
+{
+    if (lin <= 0.0031308f)
+    {
+        return lin * 12.92f;
+    }
+    else
+    {
+        return pow(lin, (1.0f / 2.4f)) * (1.055f) - 0.055f;
+    }
+}
+
+/** Returns a sRGB version of an input linear RGB color in the ITU-R BT.709 color space
+    \param LinearColor linear input color
+*/
+float3 linearToSRGB(float3 lin)
+{
+    return float3(
+        linearToSRGB(lin.x),
+        linearToSRGB(lin.y),
+        linearToSRGB(lin.z));
+}
+
+float3 ToneMapAces(float3 color)
+{
+    float A = 2.51;
+    float B = 0.03;
+    float C = 2.43;
+    float D = 0.59;
+    float E = 0.14;
+
+    color = saturate((color * (A * color + B)) / (color * (C * color + D) + E));
+    return color;
+}
+
+[numthreads(8,8,1)]
+void PostProcess(uint3 id : SV_DispatchThreadID)
+{
+    uint width;
+    uint height;
+    _Output.GetDimensions(width, height);
+    if (any(id.xy >= uint2(width, height)))
+    {
+        return;
+    }
+
+    float3 res = ToneMapAces(_Input[id.xy].xyz);
+    _Output[id.xy] = float4(res, 1.0f);
+}

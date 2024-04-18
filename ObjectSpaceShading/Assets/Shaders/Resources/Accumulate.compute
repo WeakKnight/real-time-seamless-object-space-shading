@@ -1,0 +1,30 @@
+#pragma use_dxc
+#pragma kernel CSMain
+
+Texture2D<float4> _Input;
+RWTexture2D<float4> _Accum;
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    int2 rez;
+    _Accum.GetDimensions(rez.x, rez.y);
+
+    const uint2 pixelCoord = dispatchThreadId.xy;
+    if (any(pixelCoord >= (uint2)rez))
+        return;
+
+    const float3 curColor = _Input[pixelCoord].rgb;
+    const float3 prevColor = _Accum[pixelCoord].rgb;
+    const float  rcpAccumCount = _Accum[pixelCoord].a;
+
+    // No accumulation data
+    if (rcpAccumCount <= 0)
+    {
+        _Accum[pixelCoord] = float4(curColor, 1);
+        return;
+    }
+
+    float curWeight = rcpAccumCount / (1 + rcpAccumCount);
+    _Accum[pixelCoord] = float4(lerp(prevColor, curColor, curWeight), curWeight);
+}

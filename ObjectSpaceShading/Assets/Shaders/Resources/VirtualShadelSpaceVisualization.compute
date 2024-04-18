@@ -1,0 +1,67 @@
+#pragma use_dxc
+#pragma kernel VirtualShadelSpaceVisualization
+
+int _RemapBufferWidth;
+int _RemapBufferHeight;
+ByteAddressBuffer _RemapBuffer;
+ByteAddressBuffer _OccupancyBuffer;
+RWTexture2D<float4> _Output;
+
+int2 GetTexelFromLODLevel(int size, int level, int x, int y)
+{
+    int offsetX = 0;
+    int offsetY = 0;
+
+    uint scale = 1;
+    if (level > 0)
+    {
+        scale = 1 << level;
+
+        offsetX = size;
+        offsetY = (int)(size * (float)(1.0f - 1.0f / (1 << (level - 1))));
+    }
+
+    return int2(offsetX + x / scale, offsetY + y / scale);
+}
+
+int GetLODLevelFromTexel(int size, int x, int y)
+{
+    if (x < size)
+    {
+        return 0;
+    }
+
+    return 1 + (int)log2(size / (float)(size - y));
+}
+
+[numthreads(16,16,1)]
+void VirtualShadelSpaceVisualization(uint3 id : SV_DispatchThreadID)
+{
+	uint2 pixelPos = id.xy;
+	if (any(pixelPos >= uint2(_RemapBufferWidth, _RemapBufferHeight)))
+	{
+		return;
+	}
+
+	int2 groupLocation = pixelPos;
+	int remapInfoIndex = groupLocation.x + groupLocation.y * _RemapBufferWidth;
+
+    float3 res = 0.0f;
+    uint2 bitfield = _OccupancyBuffer.Load2(remapInfoIndex * 8u);
+    if (bitfield.x > 0 || bitfield.y > 0)
+    {
+        res = 0.66f;
+    }
+
+    int lodLevel = GetLODLevelFromTexel(_RemapBufferHeight, pixelPos.x, pixelPos.y);
+
+    int2 start = GetTexelFromLODLevel(_RemapBufferHeight, lodLevel, 0, 0);
+    int2 end = GetTexelFromLODLevel(_RemapBufferHeight, lodLevel, _RemapBufferHeight - 1, _RemapBufferHeight - 1);
+
+    if (lodLevel <= 3 && (any(pixelPos == start) || any(pixelPos == end)) && (pixelPos.x <= end.x))
+    {
+        res = float3(0.2, 0.8, 0.2);
+    }
+
+    _Output[pixelPos] = float4(res, 1.0f);
+}

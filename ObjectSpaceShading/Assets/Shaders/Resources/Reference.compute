@@ -1,0 +1,109 @@
+#pragma use_dxc
+#pragma require int64BufferAtomics
+#pragma require inlineraytracing
+#pragma kernel main
+
+#include "OSSUtils.cginc"
+#include "GlobalShaderVariables.hlsl"
+#include "Packages/com.tencent.tmgp.gpu-scene/Shaders/Resources/GPUScene.cginc"
+#include "Packages/com.tencent.tmgp.gpu-scene/Shaders/Resources/RandomSampler.cginc"
+
+Texture2D<float4> _Position;
+Texture2D<float4> _Normal;
+Texture2D<float4> _BaseColor;
+
+RWTexture2D<float4> _Output;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+int _FrameIndex;
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+[numthreads(16, 16, 1)]
+void main(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    uint width;
+    uint height;
+    _Output.GetDimensions(width, height);
+    if (any(dispatchThreadId.xy >= uint2(width, height)))
+    {
+        return;
+    }
+
+    const uint2 pixelPos = dispatchThreadId.xy;
+    
+    float3 res;
+
+    if (_Position[pixelPos].w < 0.01f)
+    {
+        float2 uv = float2((dispatchThreadId.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+        // Get a ray for the UVs
+        Ray ray = CreateCameraRay(uv);
+
+        res = GPUScene_GetSkyColor(ray.direction);
+    }
+    else
+    {
+        const uint seed = (pixelPos.x + (uint)(pixelPos.y * width));
+        RandomSequence randomSequence;
+        RandomSequence_Initialize(randomSequence, seed, _FrameIndex);
+
+        float curWeight = 1.0 / (_FrameIndex + 1);
+        float3 posW = _Position[pixelPos].xyz;
+        float3 normalW = _Normal[pixelPos].xyz;
+        float3 baseColor = _BaseColor[pixelPos].xyz;
+        float3 rayOrigin = ComputeRayOrigin(posW, normalW);
+
+        res = 0.0f;
+
+        if (!GPUScene_AnyHit(rayOrigin, GPUScene_MainLightDirection.xyz, 1e30f))
+        {
+            res += baseColor / __PI * saturate(dot(normalW, GPUScene_MainLightDirection.xyz)) * GPUScene_MainLightColor.xyz;
+        }
+
+        float pdf;
+        float3 scatterDir = CosineWeightedSampling(RandomSequence_GenerateSample2D(randomSequence), normalW, pdf);
+        if (pdf > 0.0f)
+        {
+            GPUScene_Intersection intersection;
+            if (GPUScene_Intersect(RandomSequence_GenerateSample1D(randomSequence), rayOrigin, scatterDir, 1e30f, intersection))
+            {
+                res += baseColor * (intersection.irradiance + intersection.emissive);
+            }
+        }
+    }
+
+    _Output[pixelPos] = float4(ToneMapAces(res * _ExposureValue.x), 1.0f);
+
+    //_Output[pixelPos] = float4(posW, 1.0f);
+
+    // _Output[pixelPos] = float4(normalW * 0.5f + 0.5f, 1.0f);
+    //_Output[pixelPos] = _SumColor[pixelPos] * curWeight;
+}

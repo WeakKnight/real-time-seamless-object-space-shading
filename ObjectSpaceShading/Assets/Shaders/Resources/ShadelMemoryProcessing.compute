@@ -1,0 +1,60 @@
+#pragma use_dxc
+#pragma kernel ClearAllocation
+#pragma kernel ShadelMemoryAllocationFirstPass
+#pragma kernel ClearStorageBuffer
+
+#include "ShadelAllocator.cginc"
+
+int _RemapBufferLength;
+
+int _RemapBufferWidth;
+int _RemapBufferHeight;
+RWByteAddressBuffer _RemapBuffer;
+RWByteAddressBuffer _OccupancyBuffer;
+
+int _StorageBufferWidth;
+int _StorageBufferHeight;
+RWTexture2D<float4> _StorageBuffer;
+
+[numthreads(1, 1, 1)]
+void ClearAllocation(uint id : SV_DispatchThreadID)
+{
+    ShadelAllocator::Clear();
+}
+
+[numthreads(8, 8, 1)]
+void ShadelMemoryAllocationFirstPass (uint2 id : SV_DispatchThreadID)
+{
+	if (any(id >= uint2(_RemapBufferWidth, _RemapBufferHeight)))
+	{
+		return;
+	}
+
+    uint remapInfoIndex = id.x + id.y * _RemapBufferWidth;
+
+    uint2 bitfield = _OccupancyBuffer.Load2((int)(remapInfoIndex * 8u));
+    if (all(bitfield == 0))
+    {
+        return;
+    }
+
+	uint shadelCount = countbits(bitfield.x) + countbits(bitfield.y);
+	if (shadelCount <= 0)
+	{
+		return;
+	}
+
+    uint shadelBaseIndex = ShadelAllocator::Allocate(shadelCount);
+	_RemapBuffer.Store(remapInfoIndex * 4u, shadelBaseIndex);
+}
+
+[numthreads(8, 8, 1)]
+void ClearStorageBuffer(uint3 id : SV_DispatchThreadID)
+{
+	if (any(id.xy >= uint2(_StorageBufferWidth * 2, _StorageBufferHeight)))
+	{
+		return;
+	}
+
+	_StorageBuffer[id.xy] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+}

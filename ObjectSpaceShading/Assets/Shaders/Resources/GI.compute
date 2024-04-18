@@ -1,0 +1,241 @@
+#pragma use_dxc
+#pragma require int64BufferAtomics
+#pragma require inlineraytracing
+#pragma kernel CSMain
+
+#include "Packages/com.tencent.tmgp.gpu-scene/Shaders/Resources/GPUScene.cginc"
+#include "RenderConfig.hlsl"
+#include "RenderTaskPrelude.cginc"
+#include "Halfedge.hlsl"
+#include "ReSTIR.hlsl"
+
+uint _MainTexUseHalfedgeTexture;
+Texture2D _MainTex_Htex;
+SamplerState sampler_MainTex_Htex;
+float2 _MainTex_Htex_QuadSize;
+float2 _MainTex_Htex_NumQuads;
+
+Texture2D _MainTex;
+SamplerState sampler_MainTex;
+float4 _BaseColor;
+Texture2D _EmissiveTex;
+SamplerState sampler_EmissiveTex;
+float4 _EmissiveColor;
+
+bool EnableAtlasVisualization()
+{
+    return _VisualizationMode == 1;
+}
+
+bool EnableShadingIntervalVisualization()
+{
+    return _VisualizationMode == 2;
+}
+
+float4 sampleBaseMap(float2 uv0, uint primitiveIndex, float2 triangleUV, inout RandomSequence randomSequence)
+{
+    //if (_HalfedgeMesh && _MainTexUseHalfedgeTexture)
+    {
+        HalfedgeMeshTexture htex = HalfedgeMeshTexture_(_MainTex_Htex, sampler_MainTex_Htex, _MainTex_Htex_NumQuads, _MainTex_Htex_QuadSize);
+
+#if 0
+        float w = 0;
+        float4 color = 0;
+
+        {
+            float2 dir = RandomSequence_GenerateSample2D(randomSequence) * 2 - 1;
+            dir = normalize(dir);
+
+            float d = RandomSequence_GenerateSample1D(randomSequence) * 4;
+
+            // float2 dir = normalize(float2(1, 1));
+            // float d = 7;
+            float4 s = HtextureSpatialSample(htex, primitiveIndex, triangleUV, dir, d);
+            if (any(isnan(s)) || any(isinf(s)))
+            {
+                return float4(1, 0, 1, 0);
+            }
+            color += s;
+            w += 1;
+        }
+
+        color /= w;
+        return color;
+#endif
+
+        return Htexture(htex, primitiveIndex, triangleUV, 0);
+    }
+    // else
+    // {
+    //     return _MainTex.Sample(sampler_MainTex, uv0);
+    // }
+}
+
+[numthreads(8, 8, 4)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    const int instanceIndex = GetInstanceIndex();
+
+    const uint count = _TaskOffsetBuffer[instanceIndex].y;
+    if (id.z >= count)
+    {
+        return;
+    }
+    const uint offset = _TaskOffsetBuffer[instanceIndex].x;
+    const uint taskIndex = id.z + offset;
+    const TaskInfo task = UnpackTaskInfo(_TaskBuffer[taskIndex]);
+
+    DR_Shadel shadel = DR_Shadel::Create(task.shadelLocation);
+    if (!shadel.Build())
+    {
+        return;
+    }
+
+    uint2 texel = id.xy;
+    if (shadel.CheckAndFallbackToHistory(texel) && _VisualizationMode == 0)
+    {
+        // int accumulatedCount = max(1, (int)shadel.ReadAccumulatedCount(texel, true) - 1);
+        // shadel.WriteAccumulatedCount(texel, accumulatedCount);
+        return;
+    }
+
+    if (EnableShadingIntervalVisualization())
+    {
+        float3 goodColor = pow(float3(95.0 / 255.0, 1.0 / 255.0, 116.0 / 255.0), 2.2f);
+        float3 badColor = pow(float3(87.0 / 255.0, 252.0 / 255.0, 157.0 / 255.0), 2.2f);
+
+        float3 res = lerp(goodColor, badColor, (_ShadingInterval - 1.0f) / 3.0f);
+        shadel.WriteStorage(texel, float4(res, 1.0f));
+        shadel.WriteAccumulatedCount(texel, 0);
+        return;
+    }
+
+    const uint shadingFrameIndex = _FrameIndex / (uint)_ShadingInterval;
+
+    float3 res = 0.0f;
+    GeometrySample geoSample;
+    RISContext risContext = (RISContext)0;
+    if (_HalfedgeMesh == 0)
+    {
+        float2 jitter = (float2(halton(shadingFrameIndex % 16 + 1, 2), halton(shadingFrameIndex % 16 + 1, 3)));
+        geoSample = shadel.ReadGeometrySample(texel, jitter, risContext.spatialSearchRadius);
+
+        if (EnableAtlasVisualization())
+        {
+            if (EnableAtlasVisualization())
+            {
+                float2 scaler = 1.0f;
+                if (any(texel == 0) || any(texel == 7))
+
+                {
+                    scaler *= 0.3f;
+                }
+                if (any(texel % 2 != 0) && any(texel % 2 != 1))
+                {
+                    scaler *= float2(0.4, 0.4f);
+                }
+
+                int2 chartSize = GetChartSize() >> shadel.layerLevel;
+                const int2 chartLocation = GetTexelFromLODLevel(_VirtualShadelTextureHeight, shadel.layerLevel, GetChartLocation().x, GetChartLocation().y);
+
+                const uint2 virtualSpaceLocation = shadel.shadelLocation * 8 + texel;
+                const int2 locationInsideChart = (virtualSpaceLocation - chartLocation);
+
+                float2 atlasUV = (locationInsideChart) / float2(chartSize);
+                float3 faceColor = RandomColor(shadel.shadelLocation);
+                shadel.WriteStorage(texel, float4(float3(scaler * atlasUV, 0.0f), 1.0f));
+                shadel.WriteAccumulatedCount(texel, 0);
+                return;
+            }
+        }
+    }
+    else
+    {
+        int2 chartSize = GetChartSize() >> shadel.layerLevel;
+        const int2 chartLocation = GetTexelFromLODLevel(_VirtualShadelTextureHeight, shadel.layerLevel, GetChartLocation().x, GetChartLocation().y);
+
+        const uint2 virtualSpaceLocation = shadel.shadelLocation * 8 + texel;
+        const int2 locationInsideChart = (virtualSpaceLocation - chartLocation);
+        
+        int htexTextureQuadWidth = _HtexTextureQuadWidth >> shadel.layerLevel;
+        int htexTextureQuadHeight = _HtexTextureQuadHeight >> shadel.layerLevel;
+        const uint2 locationInsideQuad = locationInsideChart % uint2(htexTextureQuadWidth, htexTextureQuadHeight);
+
+        float2 quadTexelSize = 1.0f / float2(htexTextureQuadWidth, htexTextureQuadHeight);
+        float2 quadJitter = (float2(halton(shadingFrameIndex % 16 + 1, 2), halton(shadingFrameIndex % 16 + 1, 3)) - 0.5f) * quadTexelSize;
+
+        float2 htexQuadUV = (locationInsideQuad + 0.5) / float2(htexTextureQuadWidth, htexTextureQuadHeight);
+	
+        float2 duv_dx = ddx(htexQuadUV);
+        float2 duv_dy = ddy(htexQuadUV);
+        float2 max_duv = max(abs(duv_dx), abs(duv_dy));
+
+        htexQuadUV += quadJitter;
+
+        const uint2 quadLocation = FindQuadLocation(locationInsideChart, htexTextureQuadWidth, htexTextureQuadHeight);
+        const uint edgeID = QuadLocationToHalfEdgeId(quadLocation);
+
+        uint halfedgeID = ccm_EdgeToHalfedgeID(edgeID);
+        float2 triangleUV;
+        if (htexQuadUV.x + htexQuadUV.y <= 1)
+        {
+            triangleUV = htexQuadUV;
+        }
+        else
+        {
+            halfedgeID = ccm_HalfedgeTwinID(halfedgeID);
+            triangleUV = 1 - htexQuadUV;
+        }
+
+        risContext.chartLocation = chartLocation;
+        risContext.halfedgeID = halfedgeID;
+        risContext.triangleUV = triangleUV;
+        risContext.spatialSearchRadius = max(max_duv.x, max_duv.y) * _ObjectSpaceSpatialReuseSearchRadius;
+
+        geoSample = ConstructGeometrySample(halfedgeID, triangleUV);
+
+        if (EnableAtlasVisualization())
+        {
+            float2 scaler = 1.0f;
+            if (any(texel == 0) || any(texel == 7))
+
+            {
+                scaler *= 0.3f;
+            }
+            if (any(texel % 2 != 0) && any(texel % 2 != 1))
+            {
+                scaler *= float2(0.4, 0.4f);
+            }
+
+            float2 atlasUV = (locationInsideQuad + 0.5) / float2(htexTextureQuadWidth, htexTextureQuadHeight);
+            float3 faceColor = RandomColor(quadLocation);
+            shadel.WriteStorage(texel, float4(float3(scaler * atlasUV, 0.0f), 1.0f));
+            shadel.WriteAccumulatedCount(texel, 0);
+            return;
+        }
+    }
+
+    float3 rayOrigin = ComputeRayOrigin(geoSample.position, geoSample.normal);
+    if (!GPUScene_AnyHit(rayOrigin, GPUScene_MainLightDirection.xyz, 1e30f))
+    {
+        res += __InvPI * saturate(dot(geoSample.normal, GPUScene_MainLightDirection.xyz)) * GPUScene_MainLightColor.xyz;
+    }
+
+    RandomSequence randomSequence = shadel.MakeRandomSequence(texel);
+
+    res += FusedResampling(shadel, texel, rayOrigin, risContext, randomSequence, geoSample);
+
+    if (shadel.historyValid)
+    {
+        uint accumulatedCount = shadel.ReadAccumulatedCount(texel, true) + 1;
+        float3 historySample = shadel.ReadStorage(texel, true).xyz;
+
+        shadel.WriteStorage(texel, float4(lerp(historySample, res, 1.0f / accumulatedCount), 1.0f));
+        shadel.WriteAccumulatedCount(texel, min(accumulatedCount, _MaxAccumulatedFrameCount));
+    }
+    else
+    {
+        shadel.WriteStorage(texel, float4(res, 1.0f));
+        shadel.WriteAccumulatedCount(texel, 0u);
+    }
+}

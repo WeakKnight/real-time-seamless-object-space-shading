@@ -1,0 +1,420 @@
+#pragma use_dxc
+#pragma require int64BufferAtomics
+#pragma require inlineraytracing
+#pragma kernel main
+
+#include "OSSUtils.cginc"
+#include "GlobalShaderVariables.hlsl"
+#include "Packages/com.tencent.tmgp.gpu-scene/Shaders/Resources/GPUScene.cginc"
+#include "Packages/com.tencent.tmgp.gpu-scene/Shaders/Resources/RandomSampler.cginc"
+
+static int2 kScreenTileDim = { 16, 16 };
+static int2 kScreenTileBits = { 4, 4 };
+static int kReservoirSize = 72;
+
+static int kNumSpatialSamples = 2;
+static float kSpatialSearchRadius = 32;
+static int kTemporalResamplingMaxM = 20;
+
+Texture2D<float4> _Position;
+Texture2D<float4> _Normal;
+Texture2D<float4> _BaseColor;
+Texture2D<float2> _MotionVector;
+Texture2D<float4> _HistoryColorTexture;
+
+RWTexture2D<float4> _Output;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+int _FrameIndex;
+int2 _ScreenTiles;
+float2 _ScreenSize;
+
+/*
+ * ReSTIR
+ */
+
+struct GeometryContext
+{
+    float3 positionW;
+    float3 normalW;
+};
+
+GeometryContext GeometryContext_(float3 P, float3 N)
+{
+    GeometryContext context;
+    context.positionW = P;
+    context.normalW = N;
+    return context;
+}
+
+struct Reservoir
+{
+    int M;
+    float weightSum;
+    float targetPdf;
+
+    float3 radiance;
+
+    float3 hitPosition;
+    float3 hitNormal;
+    float3 shadingPosition;
+    float3 shadingNormal;
+
+    GeometryContext ShadingGeometry()
+    {
+        return GeometryContext_(shadingPosition, shadingNormal);
+    }
+
+    GeometryContext HitGeometry()
+    {
+        return GeometryContext_(hitPosition, hitNormal);
+    }
+};
+
+StructuredBuffer<Reservoir> _HistoryReservoirBuffer;
+RWStructuredBuffer<Reservoir> _OutputReservoirBuffer;
+
+uint PixelToLinearIndex(uint2 pixel)
+{
+    uint2 tileID = pixel >> kScreenTileBits;
+
+    uint stride = kScreenTileDim.x * kScreenTileDim.y;
+    uint tileIdx = tileID.y * _ScreenTiles.x + tileID.x;
+    uint tileOffset = tileIdx * stride;
+
+    uint tileBits = kScreenTileBits.x + kScreenTileBits.y;
+    uint pixelIdx = __EncodeMorton2D(pixel) & ((1 << tileBits) - 1);
+    return tileOffset + pixelIdx;
+}
+
+void SaveReservoir(int2 pixel, Reservoir reservoir)
+{
+    _OutputReservoirBuffer[PixelToLinearIndex(pixel)] = reservoir;
+}
+
+void LoadHistoryReservoir(int2 pixel, out Reservoir reservoir)
+{
+    reservoir = _HistoryReservoirBuffer[PixelToLinearIndex(pixel)];
+}
+
+Reservoir Reservoir_Empty()
+{
+    Reservoir reservoir = (Reservoir)0;
+    return reservoir;
+}
+
+bool Reservoir_Stream(inout Reservoir r,
+                      float3 shadingPosition, float3 shadingNormal,
+                      float3 hitPosition, float3 hitNormal,
+                      float3 radiance, float targetPdf, float invSourcePdf, float random)
+{
+    r.M += 1;
+
+    float risWeight = targetPdf * invSourcePdf;
+    r.weightSum += risWeight;
+
+    bool selectSample = (random * r.weightSum < risWeight);
+    if (selectSample)
+    {
+        r.shadingPosition = shadingPosition;
+        r.shadingNormal = shadingNormal;
+
+        r.hitPosition = hitPosition;
+        r.hitNormal = hitNormal;
+        r.radiance = radiance;
+
+        r.targetPdf = targetPdf;
+    }
+
+    return selectSample;
+}
+
+bool Reservoir_Combine(inout Reservoir reservoir, const Reservoir newReservoir, float random, float targetPdf, float jacobian = 1.f, float misWeight = 1.f)
+{
+    reservoir.M += newReservoir.M;
+
+    float risWeight = targetPdf * jacobian * newReservoir.weightSum * misWeight;
+    reservoir.weightSum += risWeight;
+
+    bool selectSample = (random * reservoir.weightSum < risWeight);
+    if (selectSample)
+    {
+        reservoir.shadingPosition = newReservoir.shadingPosition;
+        reservoir.shadingNormal = newReservoir.shadingNormal;
+
+        reservoir.hitPosition = newReservoir.hitPosition;
+        reservoir.hitNormal = newReservoir.hitNormal;
+        reservoir.radiance = newReservoir.radiance;
+
+        reservoir.targetPdf = targetPdf;
+    }
+
+    return selectSample;
+}
+
+void Reservoir_FinalizeResampling(inout Reservoir r, float normalizationNumerator, float normalizationDenominator)
+{
+    float denominator = normalizationDenominator;
+    r.weightSum = (denominator == 0.0) ? 0.0 : (r.weightSum * normalizationNumerator) / denominator;
+}
+
+float3 ComputeTargetF(GeometryContext shadingGeometry, float3 radiance, GeometryContext hitGeometry)
+{
+    float3 wi = normalize(hitGeometry.positionW - shadingGeometry.positionW);
+    float cosThetaI = dot(shadingGeometry.normalW, wi);
+    return radiance * saturate(cosThetaI);
+}
+
+// Calculate the elements of the Jacobian to transform the sample's solid angle.
+void __CalculatePartialJacobian(const float3 recieverPos, const float3 samplePos, const float3 sampleNormal,
+                                out float distanceToSurface, out float cosineEmissionAngle)
+{
+    float3 vec = recieverPos - samplePos;
+
+    distanceToSurface = length(vec);
+    cosineEmissionAngle = saturate(dot(sampleNormal, vec / distanceToSurface));
+}
+
+// Calculates the full Jacobian for resampling neighborReservoir into a new receiver surface
+float CalculateJacobian(float3 receiverPos, float3 receiverNormal, float3 neighborReceiverPos, const Reservoir neighborReservoir)
+{
+    // Calculate Jacobian determinant to adjust weight.
+    // See Equation (11) in the ReSTIR GI paper.
+    float originalDistance, originalCosine;
+    float newDistance, newCosine;
+    __CalculatePartialJacobian(receiverPos, neighborReservoir.hitPosition, neighborReservoir.hitNormal, newDistance, newCosine);
+    __CalculatePartialJacobian(neighborReceiverPos, neighborReservoir.hitPosition, neighborReservoir.hitNormal, originalDistance, originalCosine);
+
+    float newNDotL = 1.0f;
+    float oldNDotL = 1.0f;
+    float jacobian = (oldNDotL * newCosine * originalDistance * originalDistance) / (newNDotL * originalCosine * newDistance * newDistance);
+
+    if (isinf(jacobian) || isnan(jacobian))
+        jacobian = 0;
+
+    return jacobian;
+}
+
+bool ValidateJacobian(inout float jacobian)
+{
+    if (isinf(jacobian) || isnan(jacobian))
+    {
+        return false;
+    }
+
+    // Sold angle ratio is too different. Discard the sample.
+    if (jacobian > 10.0 || jacobian < 1 / 10.0)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+float ShiftMappingReconnection(Reservoir srcReservoir, GeometryContext dstSurface, out float jacobian)
+{
+    //! TODO: Use Age For Geometry Reconstruction.
+    jacobian = CalculateJacobian(dstSurface.positionW, dstSurface.normalW, srcReservoir.shadingPosition, srcReservoir);
+    if (!ValidateJacobian(jacobian))
+    {
+        jacobian = 0;
+        return 0;
+    }
+
+    float targetPdf = __CalcLuminance(ComputeTargetF(dstSurface, srcReservoir.radiance, srcReservoir.HitGeometry()));
+    return targetPdf;
+}
+
+bool GeometryTest(GeometryContext local, GeometryContext neighbor)
+{
+    const float normalThreshold = 0.75f;
+    const float depthThreshold = 0.07f;
+
+    float localLinearZ = abs(mul(_WorldToCameraMat, float4(local.positionW, 1.0f)).z);
+    float neighborLinearZ = abs(mul(_WorldToCameraMat, float4(neighbor.positionW, 1.0f)).z);
+
+    if (abs(localLinearZ - neighborLinearZ) > depthThreshold * localLinearZ)
+    {
+        return false;
+    }
+
+    if (dot(local.normalW, neighbor.normalW) < normalThreshold)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ */
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+[numthreads(16, 16, 1)]
+void main(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    if (any(dispatchThreadId.xy >= uint2(_ScreenSize)))
+    {
+        return;
+    }
+
+    const uint2 pixelPos = dispatchThreadId.xy;
+
+    float3 res;
+    Reservoir risState = Reservoir_Empty();
+
+    if (_Position[pixelPos].w < 0.01f)
+    {
+        float2 uv = float2((dispatchThreadId.xy + float2(0.5f, 0.5f)) / _ScreenSize * 2.0f - 1.0f);
+        // Get a ray for the UVs
+        Ray ray = CreateCameraRay(uv);
+
+        res = GPUScene_GetSkyColor(ray.direction);
+    }
+    else
+    {
+        const uint seed = (pixelPos.x + (uint)(pixelPos.y * _ScreenSize.x));
+        RandomSequence randomSequence;
+        RandomSequence_Initialize(randomSequence, seed, _FrameIndex);
+
+        float3 posW = _Position[pixelPos].xyz;
+        float3 normalW = _Normal[pixelPos].xyz;
+        float3 baseColor = _BaseColor[pixelPos].xyz;
+
+        float3 rayOrigin = ComputeRayOrigin(posW, normalW);
+
+        res = 0.0f;
+
+        if (!GPUScene_AnyHit(rayOrigin, GPUScene_MainLightDirection.xyz, 1e30f))
+        {
+            res += baseColor / __PI * saturate(dot(normalW, GPUScene_MainLightDirection.xyz)) * GPUScene_MainLightColor.xyz;
+        }
+
+        
+        // if (pdf > 0.0f)
+        {
+            Reservoir initialReservoir = Reservoir_Empty();
+            {
+                // Initial Sample
+                for (int i = 0; i < 24; i++)
+                {
+                    float pdf;
+                    float3 scatterDir = CosineWeightedSampling(RandomSequence_GenerateSample2D(randomSequence), normalW, pdf);
+                    if (pdf > 0.0f)
+                    {
+                    GPUScene_Intersection intersection;
+                    if (GPUScene_Intersect(RandomSequence_GenerateSample1D(randomSequence), rayOrigin, scatterDir, 1e30f, intersection))
+                    {
+                        float3 radiance = intersection.irradiance + intersection.emissive;
+                        float targetPdf = __CalcLuminance(ComputeTargetF(GeometryContext_(posW, normalW), radiance, GeometryContext_(intersection.hitPosW, intersection.hitNormalW)));
+
+                        Reservoir_Stream(initialReservoir,
+                                        posW, normalW,
+                                        intersection.hitPosW, intersection.hitNormalW,
+                                        radiance, targetPdf, 1 / pdf,
+                                        RandomSequence_GenerateSample1D(randomSequence));
+                    }
+                    }
+                    else
+                    {
+                        initialReservoir.M += 1;
+                    }
+                }
+
+                Reservoir_FinalizeResampling(initialReservoir, 1, initialReservoir.targetPdf * initialReservoir.M);
+                initialReservoir.M = 1;
+
+                Reservoir_Combine(risState, initialReservoir, RandomSequence_GenerateSample1D(randomSequence), initialReservoir.targetPdf, 1, initialReservoir.M);
+            }
+
+            {
+                // Fused ReSTIR
+                float2 motion = _MotionVector[pixelPos];
+                int2 temporalPixelPos = (int2)pixelPos - (int2)(_ScreenSize * motion);
+
+                for (uint i = 0; i < kNumSpatialSamples; ++i)
+                {
+                    int2 pixelOffset = 0;
+                    if (i > 0)
+                    {
+                        pixelOffset = (RandomSequence_GenerateSample2D(randomSequence) - 0.5) * kSpatialSearchRadius;
+                    }
+
+                    int2 neighborPixelPos = (int2)temporalPixelPos + pixelOffset;
+
+                    Reservoir neighborReservoir;
+                    LoadHistoryReservoir(neighborPixelPos, neighborReservoir);
+
+                    if (neighborReservoir.M == 0)
+                    {
+                        continue;
+                    }
+
+                    if (!GeometryTest(GeometryContext_(posW, normalW), neighborReservoir.ShadingGeometry()))
+                    {
+                        continue;
+                    }
+
+                    neighborReservoir.M = min(neighborReservoir.M, 20);
+
+                    float targetPdf = __CalcLuminance(ComputeTargetF(GeometryContext_(posW, normalW), neighborReservoir.radiance, neighborReservoir.HitGeometry()));
+                    float jacobian = CalculateJacobian(posW, normalW, neighborReservoir.shadingPosition, neighborReservoir);
+
+                    if (max(jacobian, 1 / jacobian) <= 10)
+                    {
+                        Reservoir_Combine(risState, neighborReservoir, RandomSequence_GenerateSample1D(randomSequence), targetPdf, jacobian, neighborReservoir.M);
+
+                        risState.shadingPosition = posW;
+                        risState.shadingNormal = normalW;
+                    }
+                }
+            }
+
+            Reservoir_FinalizeResampling(risState, 1, risState.targetPdf * risState.M);
+        }
+
+        if (risState.weightSum > 0)
+        {
+            float3 shadowRayDirection = normalize(risState.hitPosition - rayOrigin);
+            float shadowRayT = length(risState.hitPosition - rayOrigin) - 0.01;
+            if (!GPUScene_AnyHit(rayOrigin, shadowRayDirection, shadowRayT))
+            {
+                res += baseColor / __PI * ComputeTargetF(risState.ShadingGeometry(), risState.radiance, risState.HitGeometry()) * risState.weightSum;
+            }
+            else
+            {
+                risState.weightSum = 0;
+            }
+        }
+    }
+
+    SaveReservoir(pixelPos, risState);
+    _Output[pixelPos] = float4(res * _ExposureValue.x, 1.0f);
+}

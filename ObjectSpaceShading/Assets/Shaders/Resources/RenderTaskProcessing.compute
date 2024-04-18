@@ -1,0 +1,117 @@
+#pragma use_dxc
+#pragma kernel RenderTaskPrepare
+#pragma kernel RenderTaskIndirectDispatch
+
+int _RemapBufferWidth;
+int _RemapBufferHeight;
+
+int _StorageBufferWidth;
+int _StorageBufferHeight;
+
+int _VirtualShadelTextureWidth;
+int _VirtualShadelTextureHeight;
+
+static const uint _ShadelSize = 8u;
+
+ByteAddressBuffer _RemapBuffer;
+ByteAddressBuffer _OccupancyBuffer;
+
+// Task:(Shadel Location: u16 * 2, Instance Index: u32)
+RWStructuredBuffer<uint> _TaskBufferRW;
+RWByteAddressBuffer _TaskCounterBufferRW;
+
+#include "InstanceData.cginc"
+#include "OSSUtils.cginc"
+#include "Packages/com.tencent.tmgp.gpu-scene/Shaders/Resources/RandomSampler.cginc"
+#include "ShadelAllocator.cginc"
+
+void AllocateTask(uint2 shadelLocation)
+{
+    uint originValue;
+    _TaskCounterBufferRW.InterlockedAdd(0, 1u, originValue);
+    _TaskBufferRW[originValue] = PackR16UG16UToUINT(shadelLocation);
+}
+
+int _DispatchDimension;
+
+[numthreads(8, 1, 1)]
+void RenderTaskPrepare (uint id : SV_DispatchThreadID)
+{
+    if (id >= _DispatchDimension)
+    {
+        return;
+    }
+
+    uint2 startLocationInShadelChunk = (uint2)GetChartLocation() / 64u;
+    uint chartSizeInPixel = (uint)GetChartSize();
+    uint chartSizeInShadelChunk = (uint)chartSizeInPixel / 64u;
+
+    uint lod = ComputeLODFrom1DOffset(id + 1, chartSizeInShadelChunk);
+    uint base = ComputeMip1DBaseOffset(lod, chartSizeInShadelChunk);
+    uint offset = id - base;
+    uint lodChartSizeInShadelChunk = chartSizeInShadelChunk >> lod;
+
+    uint2 remapInfoPos = GetTexelFromLODLevel(_VirtualShadelTextureHeight / 64u, lod, startLocationInShadelChunk.x, startLocationInShadelChunk.y) + Convert1DTo2D(offset, lodChartSizeInShadelChunk);
+	if (any(remapInfoPos >= uint2(_RemapBufferWidth, _RemapBufferHeight)))
+	{
+		return;
+	}
+
+    uint remapInfoIndex = remapInfoPos.x + remapInfoPos.y * _RemapBufferWidth;
+    uint2 bitfield = reversebits(_OccupancyBuffer.Load2((int)(remapInfoIndex * 8u)));
+
+    {
+        uint x = bitfield.x;
+        while (x != 0) 
+        {
+            uint lsb = x & (~x + 1);
+
+            int index = 31 - (int)firstbithigh(lsb);
+            uint2 shadelLocation = remapInfoPos * 8u + uint2(index % 8u, index / 8u);
+            AllocateTask(shadelLocation);
+
+            x = x & (x - 1); // Remove the set bit (LSB)
+        }
+    }
+
+    {
+        uint x = bitfield.y;
+        while (x != 0)
+        {
+            uint lsb = x & (~x + 1);
+
+            int index = 63 - (int)firstbithigh(lsb);
+            uint2 shadelLocation = remapInfoPos * 8u + uint2(index % 8u, index / 8u);
+            AllocateTask(shadelLocation);
+
+            x = x & (x - 1); // Remove the set bit (LSB)
+        }
+    }
+}
+
+int _PrevInstanceIndex;
+RWStructuredBuffer<uint3> _ArgsBuffer;
+StructuredBuffer<uint> _TaskCounterBuffer;
+RWStructuredBuffer<uint2> _TaskOffsetBufferRW;
+
+[numthreads(1, 1, 1)]
+void RenderTaskIndirectDispatch(uint3 id : SV_DispatchThreadID)
+{
+    uint offset;
+    if (_PrevInstanceIndex < 0)
+    {
+        offset = 0;
+    }
+    else
+    {
+        offset = _TaskOffsetBufferRW[_PrevInstanceIndex].x + _TaskOffsetBufferRW[_PrevInstanceIndex].y;
+    }
+    const uint count = _TaskCounterBuffer[0] - offset;
+
+    const int instanceIndex = GetInstanceIndex();
+
+    _TaskOffsetBufferRW[instanceIndex] = uint2(offset, count);
+
+    _ArgsBuffer[2 * instanceIndex + 0] = uint3(1, 1, (count + 3) / 4);
+    _ArgsBuffer[2 * instanceIndex + 1] = uint3((_ShadelSize + 7u) / 8u, (_ShadelSize + 7u) / 8u, (count + 3) / 4);
+}

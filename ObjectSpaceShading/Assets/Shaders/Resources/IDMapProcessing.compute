@@ -1,0 +1,153 @@
+#pragma use_dxc
+
+#pragma kernel IDMapClear
+#pragma kernel IDMapDistanceClear
+#pragma kernel IDMapBorderFix
+#pragma kernel IDMapFlood
+#pragma kernel IDMapFinalize
+
+int2 _TextureDimension;
+int _Radius;
+
+Texture2D<uint> _InputTexture;
+RWTexture2D<uint> _OutputTexture;
+
+RWTexture2D<uint> _IDMap;
+
+Texture2D<uint2> _InputDistanceTexture;
+RWTexture2D<uint2> _OutputDistanceTexture;
+
+[numthreads(16, 16, 1)]
+void IDMapClear(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    if (any(dispatchThreadId.xy >= _TextureDimension))
+    {
+        return;
+    }
+
+    _IDMap[dispatchThreadId.xy] = ~0u;
+}
+
+[numthreads(16, 16, 1)]
+void IDMapDistanceClear(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    if (any(dispatchThreadId.xy >= _TextureDimension))
+    {
+        return;
+    }
+
+    _OutputDistanceTexture[dispatchThreadId.xy] = dispatchThreadId.xy;
+}
+
+[numthreads(16, 16, 1)]
+void IDMapBorderFix(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    if (any(dispatchThreadId.xy >= _TextureDimension))
+    {
+        return;
+    }
+
+    const int2 offsets[8] = {
+        int2(0, 1),
+        int2(1, 0),
+        int2(0, -1),
+        int2(-1, 0),
+        int2(1, 1),
+        int2(1, -1),
+        int2(-1, 1),
+        int2(-1, -1),
+    };
+
+    uint2 origin = _InputDistanceTexture[dispatchThreadId.xy];
+    uint val = _InputTexture[dispatchThreadId.xy];
+    if (val == ~0u)
+    {
+        for (int i = 0; i < 8; i++)
+        {
+            int2 offsetPos = clamp(int2(dispatchThreadId.xy) + _Radius * offsets[i], int2(0, 0), _TextureDimension - 1);
+            uint neighbourVal = _InputTexture[offsetPos];
+            if (neighbourVal != ~0u)
+            {
+                origin = _InputDistanceTexture[offsetPos];
+                val = neighbourVal;
+                break;
+            }
+        }
+    }
+
+    _OutputTexture[dispatchThreadId.xy] = val;
+    _OutputDistanceTexture[dispatchThreadId.xy] = origin;
+}
+
+[numthreads(16, 16, 1)]
+void IDMapFlood(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    if (any(dispatchThreadId.xy >= _TextureDimension))
+    {
+        return;
+    }
+
+    const int2 offsets[8] = 
+    {
+        int2(0, 1),
+        int2(1, 0),
+        int2(0, -1),
+        int2(-1, 0),
+        int2(1, 1),
+        int2(1, -1),
+        int2(-1, 1),
+        int2(-1, -1),
+    };
+
+    uint2 origin = _InputDistanceTexture[dispatchThreadId.xy];
+    float dist = distance(origin, dispatchThreadId.xy);
+    uint val = _InputTexture[dispatchThreadId.xy];
+    if (val == ~0u)
+    {
+        dist = 1e30f;
+    }
+
+    for (int i = 0; i < 8; i++)
+    {
+        int2 offsetPos = clamp(int2(dispatchThreadId.xy) + _Radius * offsets[i], int2(0, 0), _TextureDimension - 1);
+        uint neighbourVal = _InputTexture[offsetPos];
+        if (neighbourVal != ~0u)
+        {
+            int2 neighborOrigin = _InputDistanceTexture[offsetPos];
+            float neighborDist = distance(neighborOrigin, dispatchThreadId.xy);
+            if (neighborDist < dist)
+            {
+                val = neighbourVal;
+                origin = neighborOrigin;
+                break;
+            }
+        }
+    }
+
+    _OutputTexture[dispatchThreadId.xy] = val;
+    _OutputDistanceTexture[dispatchThreadId.xy] = origin;
+}
+
+static const uint _PrimitiveInvalidFlag = 0x80000000u;
+
+[numthreads(16, 16, 1)]
+void IDMapFinalize(uint3 dispatchThreadId: SV_DispatchThreadID)
+{
+    if (any(dispatchThreadId.xy >= _TextureDimension))
+    {
+        return;
+    }
+
+    uint2 origin = _OutputDistanceTexture[dispatchThreadId.xy];
+    if (all(origin == dispatchThreadId.xy))
+    {
+        return;
+    }
+
+    if (distance(origin, dispatchThreadId.xy) < 3.0f)
+    {
+        return;
+    }
+    
+    _OutputTexture[dispatchThreadId.xy] = _PrimitiveInvalidFlag | (origin.x + origin.y *_TextureDimension.x);
+}

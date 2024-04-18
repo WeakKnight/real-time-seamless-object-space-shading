@@ -1,0 +1,120 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma use_dxc
+#pragma require int64BufferAtomics
+#pragma require inlineraytracing
+
+#pragma kernel FinalShading
+
+#include "GPUScene.cginc"
+#include "RandomSampler.cginc"
+#include "AnalyticalSky.cginc"
+
+// RGBA32, RGBM Encoding
+RWTexture2D<float4> _MeshCardAtlasIrradianceRW;
+int _InstanceIndex;
+int _FrameIndex;
+
+static const float M_PI = 3.14159265f;
+
+float3 CosineWeightedSampling(float2 XY, float3 N, out float pdf)
+{
+    float3 w = N;
+    float3 u = 0.0;
+    if (abs(w.x) > 0.1)
+    {
+        u = normalize(cross(float3(0.0, 1.0, 0.0), w));
+    }
+    else
+    {
+        u = normalize(cross(float3(1.0, 0.0, 0.0), w));
+    }
+    float3 v = cross(w, u);
+    float r1 = 2.0 * M_PI * XY.x;
+    float r2 = XY.y;
+    float r2s = sqrt(r2);
+    float3 dir = normalize((u * cos(r1) * r2s + v * sin(r1) * r2s + w * sqrt(1.0 - r2)));
+
+    pdf = dot(N, dir) / M_PI;
+
+    return dir;
+}
+
+static const float _Alpha = 0.05f;
+
+[numthreads(8, 8, 1)]
+void FinalShading(uint3 id: SV_DispatchThreadID)
+{
+    const uint faceIndex = id.z;
+    const MeshCard meshCard = LoadMeshCard(_MeshCardIndirection[_InstanceIndex] + faceIndex);
+    if (any(id.xy >= meshCard.size))
+    {
+        return;
+    }
+    const uint2 pixel = meshCard.position + id.xy;
+
+    const float3 uvw = UnpackR10G11B11UnormFromUINT(_MeshCardAtlasPosition[pixel]);
+    const DF_InstanceData instanceData = DF_LoadInstanceData(_InstanceIndex);
+    const DF_AssetData assetData = DF_LoadAssetData(instanceData.assetIndex);
+
+    float3 position = (uvw - 0.5f) * assetData.volumeExtent;
+    float3 posW = mul(instanceData.localToWorld, float4(position, 1.0)).xyz;
+    float3 normalW = decodeNormal2x8(_MeshCardAtlasNormal[pixel]);
+
+    float cellScale = length(instanceData.localToWorld[0].xyz);
+    float worldSpaceCellSize = cellScale * assetData.volumeExtent.x / (assetData.resolutionInBricks.x * DF_UniqueBrickSize);
+    float3 rayOrigin = posW + 1.5 * worldSpaceCellSize * normalW;
+
+    float3 baseColor = _MeshCardAtlasBaseColor[pixel].xyz;
+
+    const uint seed = (id.x + (uint)(id.y * meshCard.size.x));
+    RandomSequence randomSequence;
+    RandomSequence_Initialize(randomSequence, seed, _FrameIndex);
+
+    float3 res = 0.0f;
+
+#if USE_MESH_RAY_TRACING
+    if (!GPUScene_AnyHit(rayOrigin, GPUScene_MainLightDirection.xyz, 1e30f))
+#else
+    if (!DF_AnyHitAS(rayOrigin, GPUScene_MainLightDirection.xyz, 0.05f))
+#endif
+    {
+        res += baseColor * saturate(dot(normalW, GPUScene_MainLightDirection.xyz)) * GPUScene_MainLightColor.xyz;
+    }
+
+    const uint sampleNum = 8;
+    const float sampleWeight = 1.0f / sampleNum;
+    for (uint sampleIndex = 0; sampleIndex < sampleNum; sampleIndex++)
+    {
+        float pdf;
+        float3 scatterDir = CosineWeightedSampling(RandomSequence_GenerateSample2D(randomSequence), normalW, pdf);
+
+        uint hitInstanceIndex;
+#if USE_MESH_RAY_TRACING
+        GPUScene_Intersection intersecton;
+        if (GPUScene_Intersect_NoMeshCardData(rayOrigin, scatterDir, worldSpaceCellSize, 1e30f, hitInstanceIndex, intersecton))
+        {
+            uint2 hitPixel = __ComputeMeshCardPixel(hitInstanceIndex, intersecton.hitPosW, intersecton.hitNormalW, RandomSequence_GenerateSample1D(randomSequence));
+#else
+        DF_QueryResult query = DF_IntersectAS(hitInstanceIndex, rayOrigin, scatterDir, 0.05f);
+        if (query.hit)
+        {
+            float3 hitPosW = rayOrigin + query.t * scatterDir;
+
+            DF_InstanceData hitInstance = DF_LoadInstanceData(hitInstanceIndex);
+            DF_AssetData hitAsset = DF_LoadAssetData(hitInstance.assetIndex);
+            float3 hitNormalW = normalize(DF_CalculateGradient(hitPosW, hitInstance, hitAsset));
+            uint2 hitPixel = __ComputeMeshCardPixel(hitInstanceIndex, hitPosW, hitNormalW, RandomSequence_GenerateSample1D(randomSequence));
+#endif
+            float3 irradiance = _MeshCardAtlasIrradiance[hitPixel].xyz;
+            float3 emissive = _MeshCardAtlasEmissive[hitPixel].xyz;
+            res += sampleWeight * baseColor * (irradiance + emissive);
+        }
+        else
+        {
+            float3 skyColor = GPUScene_GetSkyColor(scatterDir);
+            res += sampleWeight * baseColor * skyColor;
+        }
+    }
+
+    _MeshCardAtlasIrradianceRW[pixel] = float4(_Alpha * res + (1.0f - _Alpha) * _MeshCardAtlasIrradianceRW[pixel].xyz, 1.0f);
+}
