@@ -6,7 +6,7 @@
 - This repo includes the source code for the following Eurographics 2024 short paper
 
 > **Real-time Seamless Object Space Shading**<br>
-> Tianyu Li*, Xiaoxin Guo*<br>
+> Tianyu Li*, [Xiaoxin Guo](https://github.com/guoxx)*<br>
 > (*Joint first authors) <br>
 > [Preprint](https://github.com/WeakKnight/real-time-seamless-object-space-shading/blob/main/object_space_shading_preprint.pdf) <br/>
 
