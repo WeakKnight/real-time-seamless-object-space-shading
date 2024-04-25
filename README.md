@@ -8,6 +8,7 @@
 > **Real-time Seamless Object Space Shading**<br>
 > Tianyu Li*, [Xiaoxin Guo](https://github.com/guoxx)*<br>
 > (*Joint first authors) <br>
+> [Preprint](https://github.com/WeakKnight/real-time-seamless-object-space-shading/blob/main/object_space_shading_preprint.pdf) <br/>
 
 Object space shading remains a challenging problem in real-time rendering due to runtime overhead and object parameterization limitations. While the recently developed algorithm by Baker et al. enables high-performance real-time object
 space shading, it still suffers from seam artifacts. In this paper, we introduce an innovative object space shading system leveraging a virtualized per-halfedge texturing schema to obviate excessive shading and preclude texture seam artifacts. Moreover,
